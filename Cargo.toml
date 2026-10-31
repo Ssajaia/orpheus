@@ -1,0 +1,33 @@
+[package]
+name = "orpheus"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal, lightweight desktop music player"
+license = "MIT"
+
+[dependencies]
+directories = "6"
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+rodio = { version = "0.23", default-features = false, features = [
+    "playback",
+    "flac",
+    "mp3",
+    "vorbis",
+    "wav",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
