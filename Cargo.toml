@@ -21,6 +21,7 @@ rodio = { version = "0.23", default-features = false, features = [
     "wav",
 ] }
 serde = { version = "1", features = ["derive"] }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "ogg", "vorbis", "wav", "pcm"] }
 toml = "1"
 
 [dev-dependencies]
