@@ -5,6 +5,7 @@ A minimal, lightweight desktop music player written in Rust (`egui`/`eframe` GUI
 ## Features
 
 - Pick a local music directory (remembered between launches).
+- Reads title, artist, album and track number tags; tracks are grouped by album and ordered by track number (untagged files are kept, listed by file name under "Unknown Album").
 - Track list, current track, progress and duration.
 - Play, pause, resume, stop, previous, next, volume.
 - Automatically advances to the next track and stops after the last one.
