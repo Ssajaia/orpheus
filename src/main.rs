@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod config;
 mod library;
+mod vinyl;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
