@@ -4,13 +4,14 @@ use std::{
     cmp::Ordering,
     fs::{self, File},
     io,
+    ops::Range,
     path::{Path, PathBuf},
 };
 use symphonia::core::{
     formats::FormatOptions,
     io::MediaSourceStream,
     meta::{MetadataOptions, MetadataRevision, StandardTagKey},
-    probe::Hint,
+    probe::{Hint, ProbeResult},
 };
 
 /// File extensions (lowercase) the player accepts.
@@ -18,6 +19,9 @@ pub const EXTENSIONS: [&str; 4] = ["mp3", "wav", "flac", "ogg"];
 
 /// Label used for tracks that have no album tag.
 pub const UNKNOWN_ALBUM: &str = "Unknown Album";
+
+/// Artist shown for an album whose tracks have different artists.
+pub const VARIOUS_ARTISTS: &str = "Various Artists";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -72,37 +76,45 @@ impl Tags {
     }
 }
 
-/// Reads tags from `path`. Any failure (unreadable, unknown or corrupted
-/// file) yields empty tags.
-fn read_tags(path: &Path) -> Tags {
-    let mut tags = Tags::default();
-    let Ok(file) = File::open(path) else {
-        return tags;
-    };
+/// Opens `path` and probes its container. `None` for unreadable or
+/// unrecognised files.
+fn probe(path: &Path) -> Option<ProbeResult> {
+    let file = File::open(path).ok()?;
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
-    let Ok(mut probed) = symphonia::default::get_probe().format(
-        &hint,
-        stream,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
-    ) else {
-        return tags;
-    };
-    // Tags in the container (FLAC, Ogg, WAV) first, then those found before it (ID3).
-    if let Some(rev) = probed.format.metadata().skip_to_latest() {
-        tags.merge(rev);
-    }
-    if let Some(rev) = probed
+    symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()
+}
+
+/// Latest metadata revisions of a probed file: first the container's own
+/// (FLAC, Ogg, WAV), then those found before it (ID3).
+fn revisions(probed: &mut ProbeResult) -> [Option<MetadataRevision>; 2] {
+    let container = probed.format.metadata().skip_to_latest().cloned();
+    let leading = probed
         .metadata
         .get()
         .as_mut()
-        .and_then(|m| m.skip_to_latest())
-    {
-        tags.merge(rev);
+        .and_then(|m| m.skip_to_latest().cloned());
+    [container, leading]
+}
+
+/// Reads tags from `path`. Any failure (unreadable, unknown or corrupted
+/// file) yields empty tags.
+fn read_tags(path: &Path) -> Tags {
+    let mut tags = Tags::default();
+    if let Some(mut probed) = probe(path) {
+        for rev in revisions(&mut probed).iter().flatten() {
+            tags.merge(rev);
+        }
     }
     tags
 }
@@ -153,6 +165,80 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Track>> {
         .collect();
     tracks.sort_by(compare);
     Ok(tracks)
+}
+
+/// A run of consecutive tracks (in the sorted list from [`scan`]) that share an album.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Album {
+    pub title: String,
+    pub artist: Option<String>,
+    /// Indices into the track list.
+    pub tracks: Range<usize>,
+}
+
+/// Groups a list sorted by [`scan`] into albums. Tracks without an album
+/// form one "Unknown Album" group.
+pub fn albums(tracks: &[Track]) -> Vec<Album> {
+    let key = |t: &Track| t.album.as_ref().map(|a| a.to_lowercase());
+    let mut albums: Vec<Album> = Vec::new();
+    let mut start = 0;
+    while start < tracks.len() {
+        let group_key = key(&tracks[start]);
+        let len = tracks[start..]
+            .iter()
+            .take_while(|t| key(t) == group_key)
+            .count();
+        let group = &tracks[start..start + len];
+
+        let mut artists = group.iter().filter_map(|t| t.artist.as_deref());
+        let artist = artists.next().map(|first| {
+            if artists.all(|a| a.eq_ignore_ascii_case(first)) {
+                first.to_owned()
+            } else {
+                VARIOUS_ARTISTS.to_owned()
+            }
+        });
+        albums.push(Album {
+            title: group[0].album_label().to_owned(),
+            artist,
+            tracks: start..start + len,
+        });
+        start += len;
+    }
+    albums
+}
+
+/// Index of the album that contains track `track`.
+pub fn album_of(albums: &[Album], track: usize) -> Option<usize> {
+    albums.iter().position(|a| a.tracks.contains(&track))
+}
+
+/// Image file names looked up next to the tracks of a tagged album.
+const COVER_FILES: [&str; 4] = ["cover.jpg", "cover.png", "folder.jpg", "folder.png"];
+
+/// Raw (still encoded) cover image for an album: embedded artwork of the
+/// first track that has some, otherwise, if `folder_cover` is set, a cover
+/// file in the album's folder. Callers set it only when the folder holds a
+/// single album, since all albums of a shared folder would get the same image.
+pub fn artwork(tracks: &[Track], folder_cover: bool) -> Option<Vec<u8>> {
+    for track in tracks {
+        let Some(mut probed) = probe(&track.path) else {
+            continue;
+        };
+        for rev in revisions(&mut probed).iter().flatten() {
+            if let Some(visual) = rev.visuals().iter().find(|v| !v.data.is_empty()) {
+                return Some(visual.data.to_vec());
+            }
+        }
+    }
+    // Loose, untagged files do not belong to one album, so no folder cover.
+    let first = tracks
+        .first()
+        .filter(|t| folder_cover && t.album.is_some())?;
+    let dir = first.path.parent()?;
+    COVER_FILES
+        .iter()
+        .find_map(|name| fs::read(dir.join(name)).ok())
 }
 
 #[cfg(test)]
@@ -367,5 +453,189 @@ mod tests {
         let tracks = scan(dir.path()).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].title, "top");
+    }
+
+    /// Builds a FLAC file with only metadata blocks (no audio frames).
+    fn flac(comments: &[&str], picture: Option<&[u8]>) -> Vec<u8> {
+        fn block(kind: u8, last: bool, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![kind | if last { 0x80 } else { 0 }];
+            out.extend(&(body.len() as u32).to_be_bytes()[1..]);
+            out.extend(body);
+            out
+        }
+        let mut info = Vec::new();
+        info.extend(4096u16.to_be_bytes());
+        info.extend(4096u16.to_be_bytes());
+        info.extend([0; 6]); // frame sizes unknown
+        info.extend([0x0A, 0xC4, 0x42, 0xF0, 0, 0, 0, 0]); // 44.1 kHz, stereo, 16 bit
+        info.extend([0; 16]); // MD5
+
+        let mut vorbis = Vec::new();
+        vorbis.extend(0u32.to_le_bytes()); // empty vendor string
+        vorbis.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            vorbis.extend((c.len() as u32).to_le_bytes());
+            vorbis.extend(c.as_bytes());
+        }
+
+        let mut out = b"fLaC".to_vec();
+        out.extend(block(0, false, &info));
+        out.extend(block(4, picture.is_none(), &vorbis));
+        if let Some(data) = picture {
+            let mut pic = Vec::new();
+            pic.extend(3u32.to_be_bytes()); // front cover
+            pic.extend(9u32.to_be_bytes());
+            pic.extend(b"image/png");
+            pic.extend(0u32.to_be_bytes()); // description
+            pic.extend([0; 16]); // width, height, depth, colours
+            pic.extend((data.len() as u32).to_be_bytes());
+            pic.extend(data);
+            out.extend(block(6, true, &pic));
+        }
+        // The reader needs one frame header (with CRC-8) to find the audio start.
+        out.extend([0xFF, 0xF8, 0xC9, 0x18, 0x00, 0xC2]);
+        out.extend([0; 64]);
+        out
+    }
+
+    #[test]
+    fn reads_flac_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = flac(
+            &["TITLE=Song", "ARTIST=Band", "ALBUM=Record", "TRACKNUMBER=4"],
+            None,
+        );
+        fs::write(dir.path().join("a.flac"), bytes).unwrap();
+        let t = &scan(dir.path()).unwrap()[0];
+        assert_eq!(t.title, "Song");
+        assert_eq!(t.artist.as_deref(), Some("Band"));
+        assert_eq!(t.album.as_deref(), Some("Record"));
+        assert_eq!(t.number, Some(4));
+    }
+
+    #[test]
+    fn albums_group_consecutive_tracks_and_keep_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "a.wav",
+            &[
+                ("IPRD", "Beta"),
+                ("IPRT", "2"),
+                ("INAM", "B2"),
+                ("IART", "Y"),
+            ],
+        );
+        write(
+            dir.path(),
+            "b.wav",
+            &[
+                ("IPRD", "Alpha"),
+                ("IPRT", "2"),
+                ("INAM", "A2"),
+                ("IART", "X"),
+            ],
+        );
+        write(
+            dir.path(),
+            "c.wav",
+            &[
+                ("IPRD", "Beta"),
+                ("IPRT", "1"),
+                ("INAM", "B1"),
+                ("IART", "Y"),
+            ],
+        );
+        write(
+            dir.path(),
+            "d.wav",
+            &[
+                ("IPRD", "alpha"),
+                ("IPRT", "1"),
+                ("INAM", "A1"),
+                ("IART", "Z"),
+            ],
+        );
+        write(dir.path(), "e.wav", &[]);
+        let tracks = scan(dir.path()).unwrap();
+        let found = albums(&tracks);
+
+        let summary: Vec<_> = found
+            .iter()
+            .map(|a| (a.title.as_str(), a.artist.as_deref(), a.tracks.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("alpha", Some(VARIOUS_ARTISTS), 0..2),
+                ("Beta", Some("Y"), 2..4),
+                (UNKNOWN_ALBUM, None, 4..5),
+            ]
+        );
+        let titles = |a: &Album| {
+            tracks[a.tracks.clone()]
+                .iter()
+                .map(|t| t.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(titles(&found[0]), ["A1", "A2"]);
+        assert_eq!(titles(&found[1]), ["B1", "B2"]);
+        assert_eq!(titles(&found[2]), ["e"]);
+    }
+
+    #[test]
+    fn no_tracks_no_albums() {
+        assert!(albums(&[]).is_empty());
+    }
+
+    #[test]
+    fn finds_album_of_track() {
+        let tracks = [
+            track(Some("A"), Some(1), "a1"),
+            track(Some("A"), Some(2), "a2"),
+            track(None, None, "x"),
+        ];
+        let found = albums(&tracks);
+        assert_eq!(album_of(&found, 0), Some(0));
+        assert_eq!(album_of(&found, 1), Some(0));
+        assert_eq!(album_of(&found, 2), Some(1));
+        assert_eq!(album_of(&found, 3), None);
+    }
+
+    #[test]
+    fn artwork_comes_from_embedded_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = flac(&["ALBUM=Record"], Some(b"PNGDATA"));
+        fs::write(dir.path().join("a.flac"), bytes).unwrap();
+        let tracks = scan(dir.path()).unwrap();
+        assert_eq!(artwork(&tracks, false).as_deref(), Some(&b"PNGDATA"[..]));
+    }
+
+    #[test]
+    fn artwork_falls_back_to_cover_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.wav", &[("IPRD", "Record")]);
+        fs::write(dir.path().join("folder.png"), b"FILEDATA").unwrap();
+        let tracks = scan(dir.path()).unwrap();
+        assert_eq!(artwork(&tracks, true).as_deref(), Some(&b"FILEDATA"[..]));
+        assert_eq!(artwork(&tracks, false), None);
+    }
+
+    #[test]
+    fn missing_artwork_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.wav", &[("IPRD", "Record")]);
+        fs::write(dir.path().join("b.mp3"), b"broken").unwrap();
+        let tracks = scan(dir.path()).unwrap();
+        assert_eq!(artwork(&tracks, true), None);
+    }
+
+    #[test]
+    fn untagged_files_do_not_use_folder_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.wav", &[]);
+        fs::write(dir.path().join("cover.jpg"), b"FILEDATA").unwrap();
+        let tracks = scan(dir.path()).unwrap();
+        assert_eq!(artwork(&tracks, true), None);
     }
 }
