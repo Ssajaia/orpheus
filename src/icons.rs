@@ -1,12 +1,9 @@
 //! Simple vector icons drawn with egui shapes (no font or image assets).
 
-use eframe::egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2};
+use eframe::egui::{Color32, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    Play,
-    Pause,
-    Stop,
     Previous,
     Next,
     Volume,
@@ -21,23 +18,17 @@ fn parts(icon: Icon, rect: Rect) -> Vec<Vec<Pos2>> {
             rect.min.y + rect.height() * y,
         )
     };
-    let bar = |x0: f32, x1: f32| vec![at(x0, 0.1), at(x1, 0.1), at(x1, 0.9), at(x0, 0.9)];
     match icon {
-        Icon::Play => vec![vec![at(0.18, 0.05), at(0.18, 0.95), at(0.92, 0.5)]],
-        Icon::Pause => vec![bar(0.15, 0.4), bar(0.6, 0.85)],
-        Icon::Stop => vec![vec![
-            at(0.12, 0.12),
-            at(0.88, 0.12),
-            at(0.88, 0.88),
-            at(0.12, 0.88),
-        ]],
+        // Classic skip symbols: a bar and two triangles.
         Icon::Previous => vec![
-            bar(0.08, 0.22),
-            vec![at(0.9, 0.08), at(0.9, 0.92), at(0.3, 0.5)],
+            vec![at(0.04, 0.1), at(0.15, 0.1), at(0.15, 0.9), at(0.04, 0.9)],
+            vec![at(0.56, 0.1), at(0.56, 0.9), at(0.2, 0.5)],
+            vec![at(0.94, 0.1), at(0.94, 0.9), at(0.58, 0.5)],
         ],
         Icon::Next => vec![
-            vec![at(0.1, 0.08), at(0.1, 0.92), at(0.7, 0.5)],
-            bar(0.78, 0.92),
+            vec![at(0.85, 0.1), at(0.96, 0.1), at(0.96, 0.9), at(0.85, 0.9)],
+            vec![at(0.44, 0.1), at(0.44, 0.9), at(0.8, 0.5)],
+            vec![at(0.06, 0.1), at(0.06, 0.9), at(0.42, 0.5)],
         ],
         Icon::Volume => vec![
             vec![at(0.05, 0.36), at(0.3, 0.36), at(0.3, 0.64), at(0.05, 0.64)],
@@ -55,16 +46,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     }
 }
 
-/// A small clickable icon button with a tooltip.
-pub fn button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 26.0), Sense::click());
-    let visuals = ui.style().interact(&response);
-    ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
-    let icon_rect = Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
-    paint(ui.painter(), icon_rect, icon, visuals.fg_stroke.color);
-    response.on_hover_text(tooltip)
-}
-
 /// A non-interactive icon, e.g. a label next to a slider.
 pub fn label(ui: &mut Ui, icon: Icon) {
     let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
@@ -76,14 +57,7 @@ pub fn label(ui: &mut Ui, icon: Icon) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 6] = [
-        Icon::Play,
-        Icon::Pause,
-        Icon::Stop,
-        Icon::Previous,
-        Icon::Next,
-        Icon::Volume,
-    ];
+    const ALL: [Icon; 3] = [Icon::Previous, Icon::Next, Icon::Volume];
 
     #[test]
     fn every_icon_stays_inside_its_rect() {
@@ -106,11 +80,23 @@ mod tests {
     }
 
     #[test]
-    fn pause_has_two_bars_and_play_one_triangle() {
-        let rect = Rect::from_min_size(Pos2::ZERO, vec2(16.0, 16.0));
-        assert_eq!(parts(Icon::Pause, rect).len(), 2);
-        let play = parts(Icon::Play, rect);
-        assert_eq!(play.len(), 1);
-        assert_eq!(play[0].len(), 3);
+    fn next_mirrors_previous() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0));
+        let mut previous: Vec<Pos2> = parts(Icon::Previous, rect).into_iter().flatten().collect();
+        let mut next: Vec<Pos2> = parts(Icon::Next, rect)
+            .into_iter()
+            .flatten()
+            .map(|p| pos2(100.0 - p.x, p.y))
+            .collect();
+        let key = |p: &Pos2| ((p.x * 1000.0).round() as i32, (p.y * 1000.0).round() as i32);
+        previous.sort_by_key(key);
+        next.sort_by_key(key);
+        assert_eq!(previous.len(), next.len());
+        for (a, b) in previous.iter().zip(&next) {
+            assert!(
+                (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3,
+                "{a:?} {b:?}"
+            );
+        }
     }
 }
