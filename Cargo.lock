@@ -1824,6 +1824,7 @@ dependencies = [
  "eframe",
  "rodio",
  "serde",
+ "symphonia",
  "tempfile",
  "toml",
 ]
