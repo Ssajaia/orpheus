@@ -81,7 +81,7 @@ impl App {
         self.current = Some(index);
         match self.audio.play(&track.path) {
             Ok(()) => self.message = None,
-            Err(e) => self.message = Some(format!("Cannot play {}: {e}", track.name)),
+            Err(e) => self.message = Some(format!("Cannot play {}: {e}", track.title)),
         }
     }
 
@@ -158,11 +158,19 @@ impl eframe::App for App {
         });
 
         egui::Panel::bottom("player").show(ui, |ui| {
-            let title = self
-                .current
-                .and_then(|i| self.tracks.get(i))
-                .map_or("Nothing playing", |t| t.name.as_str());
-            ui.label(egui::RichText::new(title).strong());
+            match self.current.and_then(|i| self.tracks.get(i)) {
+                Some(track) => {
+                    ui.label(egui::RichText::new(&track.title).strong());
+                    let info = match &track.artist {
+                        Some(artist) => format!("{artist} - {}", track.album_label()),
+                        None => track.album_label().to_owned(),
+                    };
+                    ui.label(info);
+                }
+                None => {
+                    ui.label(egui::RichText::new("Nothing playing").strong());
+                }
+            }
 
             let position = self.audio.position();
             let (fraction, total) = match self.audio.duration() {
@@ -211,9 +219,19 @@ impl eframe::App for App {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
+                    let mut album = None;
                     for (i, track) in self.tracks.iter().enumerate() {
+                        // Tracks are sorted by album, so a header marks each new group.
+                        if album != Some(track.album_label()) {
+                            album = Some(track.album_label());
+                            ui.label(egui::RichText::new(track.album_label()).weak());
+                        }
+                        let label = match track.number {
+                            Some(n) => format!("{n}. {}", track.title),
+                            None => track.title.clone(),
+                        };
                         if ui
-                            .selectable_label(self.current == Some(i), &track.name)
+                            .selectable_label(self.current == Some(i), label)
                             .clicked()
                         {
                             clicked = Some(i);
