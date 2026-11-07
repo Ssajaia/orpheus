@@ -6,9 +6,10 @@ A minimal, lightweight desktop music player written in Rust (`egui`/`eframe` GUI
 
 - Pick a local music directory (remembered between launches).
 - Reads title, artist, album and track number tags; tracks are grouped by album and ordered by track number (untagged files are kept, listed by file name under "Unknown Album").
-- Track list, current track, progress and duration.
+- Album grid with cover art (embedded artwork, or a `cover.jpg`/`cover.png`/`folder.jpg`/`folder.png` file when the folder holds a single album); select an album to see its tracks and play it.
+- Current track, progress and duration.
 - Play, pause, resume, stop, previous, next, volume.
-- Automatically advances to the next track and stops after the last one.
+- Plays an album in order and stops after its last track; previous/next stay within the album.
 - Dark theme, no network access, no telemetry.
 
 ## Supported platforms
