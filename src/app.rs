@@ -3,6 +3,7 @@
 use crate::{
     audio::{Audio, State},
     config::{self, Config},
+    icons::{self, Icon},
     library::{self, Album, Track},
     vinyl::{self, Turntable},
 };
@@ -333,7 +334,13 @@ impl App {
             ui.available_width(),
             (ui.available_height() - RECORD_TEXT_HEIGHT).max(0.0),
         );
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let on_label = response
+            .hover_pos()
+            .is_some_and(|pos| vinyl::label_contains(rect, pos));
+        if on_label {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         let progress = progress(self.audio.position(), self.audio.duration());
         vinyl::paint(
             ui.painter(),
@@ -341,7 +348,12 @@ impl App {
             &self.turntable,
             cover.as_ref().map(egui::TextureHandle::id),
             progress,
+            toggle_icon(state),
+            on_label,
         );
+        if response.clicked() && on_label {
+            self.toggle();
+        }
 
         let track = &self.tracks[current];
         ui.vertical_centered(|ui| {
@@ -402,6 +414,14 @@ fn load_cover(
     let size = [image.width() as usize, image.height() as usize];
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
     Some(ctx.load_texture("cover", pixels, egui::TextureOptions::LINEAR))
+}
+
+/// Icon of what the play/pause button does next.
+fn toggle_icon(state: State) -> Icon {
+    match state {
+        State::Playing => Icon::Pause,
+        State::Paused | State::Stopped => Icon::Play,
+    }
 }
 
 fn format_time(d: Duration) -> String {
@@ -482,25 +502,25 @@ impl eframe::App for App {
             );
 
             ui.horizontal(|ui| {
-                if ui.button("Prev").clicked() {
+                if icons::button(ui, Icon::Previous, "Previous").clicked() {
                     self.previous();
                 }
-                let label = match self.audio.state() {
-                    State::Stopped => "Play",
-                    State::Playing => "Pause",
-                    State::Paused => "Resume",
+                let (tooltip, icon) = match self.audio.state() {
+                    State::Stopped => ("Play", Icon::Play),
+                    State::Playing => ("Pause", Icon::Pause),
+                    State::Paused => ("Resume", Icon::Play),
                 };
-                if ui.button(label).clicked() {
+                if icons::button(ui, icon, tooltip).clicked() {
                     self.toggle();
                 }
-                if ui.button("Stop").clicked() {
+                if icons::button(ui, Icon::Stop, "Stop").clicked() {
                     self.audio.stop();
                 }
-                if ui.button("Next").clicked() {
+                if icons::button(ui, Icon::Next, "Next").clicked() {
                     self.next();
                 }
                 let mut volume = self.audio.volume();
-                ui.label("Vol");
+                icons::label(ui, Icon::Volume);
                 if ui
                     .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
                     .changed()
@@ -560,6 +580,13 @@ mod tests {
         let scope = 3..6;
         assert_eq!(next_index(&scope, Some(9)), Some(3));
         assert_eq!(previous_index(&scope, Some(1)), Some(5));
+    }
+
+    #[test]
+    fn toggle_icon_shows_the_next_action() {
+        assert_eq!(toggle_icon(State::Playing), Icon::Pause);
+        assert_eq!(toggle_icon(State::Paused), Icon::Play);
+        assert_eq!(toggle_icon(State::Stopped), Icon::Play);
     }
 
     #[test]
