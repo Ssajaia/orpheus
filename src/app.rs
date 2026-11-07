@@ -4,6 +4,7 @@ use crate::{
     audio::{Audio, State},
     config::{self, Config},
     library::{self, Album, Track},
+    vinyl::{self, Turntable},
 };
 use eframe::egui;
 use std::{ops::Range, path::PathBuf, time::Duration};
@@ -14,6 +15,10 @@ const COVER_PX: u32 = 160;
 const GRID_COVER: f32 = 112.0;
 /// Size (points) of the cover in the album view.
 const VIEW_COVER: f32 = 96.0;
+/// Delay between frames while the record or tonearm is moving (about 60 fps).
+const ANIMATION_FRAME: Duration = Duration::from_millis(16);
+/// Height reserved below the record for the track title and artist.
+const RECORD_TEXT_HEIGHT: f32 = 64.0;
 /// Covers decoded per frame at most, so a big grid does not stall the UI.
 const COVERS_PER_FRAME: u8 = 2;
 
@@ -37,6 +42,9 @@ pub struct App {
     folder_cover: bool,
     /// Album whose tracks are shown; `None` shows the album grid.
     selected: Option<usize>,
+    /// Show the vinyl playback view instead of the library.
+    record_view: bool,
+    turntable: Turntable,
     current: Option<usize>,
     audio: Audio,
     message: Option<String>,
@@ -66,6 +74,8 @@ impl App {
             cover_budget: COVERS_PER_FRAME,
             folder_cover: false,
             selected: None,
+            record_view: false,
+            turntable: Turntable::default(),
             current: None,
             message: None,
         };
@@ -79,6 +89,7 @@ impl App {
         self.audio.stop();
         self.current = None;
         self.selected = None;
+        self.record_view = false;
         match library::scan(&dir) {
             Ok(tracks) => {
                 self.message = tracks
@@ -273,6 +284,7 @@ impl App {
                 ui.label(format!("{} tracks", album.tracks.len()));
                 if ui.button("Play album").clicked() {
                     self.play_index(album.tracks.start);
+                    self.record_view = true;
                 }
             });
         });
@@ -298,7 +310,57 @@ impl App {
             });
         if let Some(i) = clicked {
             self.play_index(i);
+            self.record_view = true;
         }
+    }
+
+    /// The vinyl playback view: record with cover art, tonearm, title and artist.
+    fn record_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(current) = self.current.filter(|&i| i < self.tracks.len()) else {
+            return;
+        };
+        let album = library::album_of(&self.albums, current);
+        let cover = album.and_then(|a| self.cover(ui.ctx(), a));
+
+        let state = self.audio.state();
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        self.turntable.update(dt, state);
+        if self.turntable.is_animating(state) {
+            ui.ctx().request_repaint_after(ANIMATION_FRAME);
+        }
+
+        let size = egui::vec2(
+            ui.available_width(),
+            (ui.available_height() - RECORD_TEXT_HEIGHT).max(0.0),
+        );
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let progress = progress(self.audio.position(), self.audio.duration());
+        vinyl::paint(
+            ui.painter(),
+            rect,
+            &self.turntable,
+            cover.as_ref().map(egui::TextureHandle::id),
+            progress,
+        );
+
+        let track = &self.tracks[current];
+        ui.vertical_centered(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(&track.title).size(20.0).strong()).truncate(),
+            );
+            let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+            ui.add(egui::Label::new(egui::RichText::new(artist).weak()).truncate());
+        });
+    }
+}
+
+/// Fraction (0..1) of the track that has been played; 0 when the length is unknown.
+fn progress(position: Duration, total: Option<Duration>) -> f32 {
+    match total {
+        Some(total) if !total.is_zero() => {
+            (position.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
     }
 }
 
@@ -359,7 +421,21 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top").show(ui, |ui| {
-            ui.heading("Orpheus");
+            ui.horizontal(|ui| {
+                ui.heading("Orpheus");
+                if self.current.is_some() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if self.record_view {
+                            "Library"
+                        } else {
+                            "Record"
+                        };
+                        if ui.button(label).clicked() {
+                            self.record_view = !self.record_view;
+                        }
+                    });
+                }
+            });
             ui.horizontal(|ui| {
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.dir_input)
@@ -377,7 +453,10 @@ impl eframe::App for App {
         });
 
         egui::Panel::bottom("player").show(ui, |ui| {
-            match self.current.and_then(|i| self.tracks.get(i)) {
+            let track = self.current.and_then(|i| self.tracks.get(i));
+            match track {
+                // The record view shows the title itself.
+                Some(_) if self.record_view => {}
                 Some(track) => {
                     ui.label(egui::RichText::new(&track.title).strong());
                     let info = match &track.artist {
@@ -392,15 +471,13 @@ impl eframe::App for App {
             }
 
             let position = self.audio.position();
-            let (fraction, total) = match self.audio.duration() {
-                Some(d) if !d.is_zero() => (
-                    (position.as_secs_f32() / d.as_secs_f32()).clamp(0.0, 1.0),
-                    format_time(d),
-                ),
-                _ => (0.0, "--:--".to_owned()),
-            };
+            let total = self
+                .audio
+                .duration()
+                .filter(|d| !d.is_zero())
+                .map_or_else(|| "--:--".to_owned(), format_time);
             ui.add(
-                egui::ProgressBar::new(fraction)
+                egui::ProgressBar::new(progress(position, self.audio.duration()))
                     .text(format!("{} / {total}", format_time(position))),
             );
 
@@ -433,9 +510,17 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| match self.selected {
-            Some(album) => self.album_view(ui, album),
-            None => self.album_grid(ui),
+        let show_record = self.record_view && self.current.is_some();
+        let mut frame = egui::Frame::central_panel(ui.style());
+        if show_record {
+            frame = frame.fill(vinyl::BACKGROUND);
+        }
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            match (show_record, self.selected) {
+                (true, _) => self.record_ui(ui),
+                (false, Some(album)) => self.album_view(ui, album),
+                (false, None) => self.album_grid(ui),
+            }
         });
     }
 
@@ -475,6 +560,20 @@ mod tests {
         let scope = 3..6;
         assert_eq!(next_index(&scope, Some(9)), Some(3));
         assert_eq!(previous_index(&scope, Some(1)), Some(5));
+    }
+
+    #[test]
+    fn progress_is_a_clamped_fraction() {
+        let total = Some(Duration::from_secs(200));
+        assert_eq!(progress(Duration::from_secs(50), total), 0.25);
+        assert_eq!(progress(Duration::from_secs(500), total), 1.0);
+        assert_eq!(progress(Duration::ZERO, total), 0.0);
+    }
+
+    #[test]
+    fn progress_is_zero_without_a_known_length() {
+        assert_eq!(progress(Duration::from_secs(5), None), 0.0);
+        assert_eq!(progress(Duration::from_secs(5), Some(Duration::ZERO)), 0.0);
     }
 
     #[test]
