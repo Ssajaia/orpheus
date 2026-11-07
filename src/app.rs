@@ -8,7 +8,11 @@ use crate::{
     vinyl::{self, Turntable},
 };
 use eframe::egui;
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// Edge length (pixels) of the stored cover thumbnails.
 const COVER_PX: u32 = 160;
@@ -34,7 +38,12 @@ enum Cover {
 pub struct App {
     config: Config,
     config_path: Option<PathBuf>,
+    /// Text of the music-folder field while it is being edited.
     dir_input: String,
+    /// The music-folder field is open for editing.
+    editing_dir: bool,
+    /// Give the music-folder field keyboard focus on the next frame.
+    focus_dir: bool,
     tracks: Vec<Track>,
     albums: Vec<Album>,
     covers: Vec<Cover>,
@@ -53,20 +62,22 @@ pub struct App {
 
 impl App {
     pub fn new(ctx: &egui::Context) -> Self {
+        Self::with_config(ctx, config::default_path())
+    }
+
+    fn with_config(ctx: &egui::Context, config_path: Option<PathBuf>) -> Self {
         ctx.set_visuals(egui::Visuals::dark());
 
-        let config_path = config::default_path();
         let config = config_path
             .as_deref()
             .map(Config::load_from)
             .unwrap_or_default();
         let mut app = Self {
             audio: Audio::new(config.volume),
-            dir_input: config
-                .music_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+            dir_input: path_text(config.music_dir.as_deref()),
+            // Without a remembered folder the field is open right away.
+            editing_dir: config.music_dir.is_none(),
+            focus_dir: false,
             config,
             config_path,
             tracks: Vec::new(),
@@ -86,7 +97,9 @@ impl App {
         app
     }
 
-    fn load_dir(&mut self, dir: PathBuf) {
+    /// Scans `dir` and makes it the music folder. On failure the folder field
+    /// stays open so the path can be corrected.
+    fn load_dir(&mut self, dir: PathBuf) -> bool {
         self.audio.stop();
         self.current = None;
         self.selected = None;
@@ -97,14 +110,30 @@ impl App {
                     .is_empty()
                     .then(|| "No supported audio files found".into());
                 self.set_tracks(tracks);
+                self.dir_input = path_text(Some(&dir));
                 self.config.music_dir = Some(dir);
+                self.editing_dir = false;
                 self.save_config();
+                true
             }
             Err(e) => {
                 self.set_tracks(Vec::new());
                 self.message = Some(format!("Cannot read directory: {e}"));
+                self.editing_dir = true;
+                false
             }
         }
+    }
+
+    fn start_editing_dir(&mut self) {
+        self.editing_dir = true;
+        self.focus_dir = true;
+    }
+
+    /// Closes the folder field, discarding what was typed.
+    fn cancel_editing_dir(&mut self) {
+        self.editing_dir = false;
+        self.dir_input = path_text(self.config.music_dir.as_deref());
     }
 
     fn set_tracks(&mut self, tracks: Vec<Track>) {
@@ -163,13 +192,15 @@ impl App {
         }
     }
 
-    fn toggle(&mut self) {
-        match self.audio.state() {
-            State::Playing => self.audio.pause(),
-            State::Paused => self.audio.resume(),
-            State::Stopped => {
-                let start = self.current.unwrap_or(self.scope().start);
-                self.play_index(start);
+    fn apply_needle(&mut self, action: NeedleAction) {
+        match action {
+            NeedleAction::Keep => {}
+            NeedleAction::Pause => self.audio.pause(),
+            NeedleAction::Resume => self.audio.resume(),
+            NeedleAction::Restart => {
+                if let Some(index) = self.current {
+                    self.play_index(index);
+                }
             }
         }
     }
@@ -315,7 +346,83 @@ impl App {
         }
     }
 
-    /// The vinyl playback view: record with cover art, tonearm, title and artist.
+    /// The music-folder line under the title: the current path with a button
+    /// to change it, or an editable path field.
+    fn library_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.editing_dir {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.dir_input)
+                        .hint_text("Path to your music folder")
+                        .desired_width((ui.available_width() - 120.0).max(60.0)),
+                );
+                if std::mem::take(&mut self.focus_dir) {
+                    edit.request_focus();
+                }
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Open").clicked() || entered {
+                    self.load_dir(PathBuf::from(self.dir_input.trim()));
+                } else if ui.button("Cancel").clicked()
+                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.cancel_editing_dir();
+                }
+            } else {
+                let (text, button) = match &self.config.music_dir {
+                    Some(dir) => (path_text(Some(dir)), "Change"),
+                    None => ("No music folder selected".to_owned(), "Choose"),
+                };
+                if ui.small_button(button).clicked() {
+                    self.start_editing_dir();
+                }
+                ui.add(egui::Label::new(egui::RichText::new(&text).weak().small()).truncate())
+                    .on_hover_text(text);
+            }
+        });
+    }
+
+    /// Lets the user hold the tonearm and move it along its arc. Lifting the
+    /// needle off the record pauses at once; dropping it back on resumes.
+    fn drag_needle(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        layout: &vinyl::Layout,
+        state: State,
+    ) {
+        let origin = ui.input(|i| i.pointer.press_origin());
+        if response.drag_started()
+            && origin.is_some_and(|p| vinyl::arm_contains(layout, &self.turntable, p))
+        {
+            self.turntable.grab();
+        }
+        if !self.turntable.is_dragging() {
+            if response
+                .hover_pos()
+                .is_some_and(|p| vinyl::arm_contains(layout, &self.turntable, p))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            return;
+        }
+        if !response.dragged() {
+            self.turntable.release();
+            let action = needle_action(state, self.turntable.over_record());
+            self.apply_needle(action);
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(pos) = response.interact_pointer_pos() {
+            self.turntable.drag_to(vinyl::arm_angle_at(layout, pos));
+        }
+        let action = needle_action(state, self.turntable.over_record());
+        if action == NeedleAction::Pause {
+            self.apply_needle(action);
+        }
+    }
+
+    /// The vinyl playback view: record with cover art, draggable tonearm,
+    /// previous/next buttons, title and artist.
     fn record_ui(&mut self, ui: &mut egui::Ui) {
         let Some(current) = self.current.filter(|&i| i < self.tracks.len()) else {
             return;
@@ -324,9 +431,10 @@ impl App {
         let cover = album.and_then(|a| self.cover(ui.ctx(), a));
 
         let state = self.audio.state();
+        let progress = progress(self.audio.position(), self.audio.duration());
         let dt = ui.input(|i| i.stable_dt).min(0.1);
-        self.turntable.update(dt, state);
-        if self.turntable.is_animating(state) {
+        self.turntable.update(dt, state, progress);
+        if self.turntable.is_animating(state, progress) {
             ui.ctx().request_repaint_after(ANIMATION_FRAME);
         }
 
@@ -334,25 +442,20 @@ impl App {
             ui.available_width(),
             (ui.available_height() - RECORD_TEXT_HEIGHT).max(0.0),
         );
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-        let on_label = response
-            .hover_pos()
-            .is_some_and(|pos| vinyl::label_contains(rect, pos));
-        if on_label {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let progress = progress(self.audio.position(), self.audio.duration());
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+        let layout = vinyl::layout(rect);
+        self.drag_needle(ui, &response, &layout, state);
         vinyl::paint(
             ui.painter(),
-            rect,
+            &layout,
             &self.turntable,
             cover.as_ref().map(egui::TextureHandle::id),
-            progress,
-            toggle_icon(state),
-            on_label,
         );
-        if response.clicked() && on_label {
-            self.toggle();
+        if vinyl::skip_button(ui, layout.prev, layout.button, Icon::Previous, "Previous") {
+            self.previous();
+        }
+        if vinyl::skip_button(ui, layout.next, layout.button, Icon::Next, "Next") {
+            self.next();
         }
 
         let track = &self.tracks[current];
@@ -364,6 +467,32 @@ impl App {
             ui.add(egui::Label::new(egui::RichText::new(artist).weak()).truncate());
         });
     }
+}
+
+/// What lifting or dropping the needle does to playback.
+#[derive(Debug, PartialEq, Eq)]
+enum NeedleAction {
+    Keep,
+    /// Needle left the record while playing.
+    Pause,
+    /// Needle returned to the record while paused; continues where it stopped.
+    Resume,
+    /// Needle dropped on the record with nothing playing: start the track.
+    Restart,
+}
+
+fn needle_action(state: State, on_record: bool) -> NeedleAction {
+    match (state, on_record) {
+        (State::Playing, false) => NeedleAction::Pause,
+        (State::Paused, true) => NeedleAction::Resume,
+        (State::Stopped, true) => NeedleAction::Restart,
+        _ => NeedleAction::Keep,
+    }
+}
+
+/// A path as shown to the user; empty when there is none.
+fn path_text(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string()).unwrap_or_default()
 }
 
 /// Fraction (0..1) of the track that has been played; 0 when the length is unknown.
@@ -416,19 +545,6 @@ fn load_cover(
     Some(ctx.load_texture("cover", pixels, egui::TextureOptions::LINEAR))
 }
 
-/// Icon of what the play/pause button does next.
-fn toggle_icon(state: State) -> Icon {
-    match state {
-        State::Playing => Icon::Pause,
-        State::Paused | State::Stopped => Icon::Play,
-    }
-}
-
-fn format_time(d: Duration) -> String {
-    let secs = d.as_secs();
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.cover_budget = COVERS_PER_FRAME;
@@ -456,17 +572,7 @@ impl eframe::App for App {
                     });
                 }
             });
-            ui.horizontal(|ui| {
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.dir_input)
-                        .hint_text("Music directory")
-                        .desired_width(ui.available_width() - 60.0),
-                );
-                let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Load").clicked() || submitted {
-                    self.load_dir(PathBuf::from(self.dir_input.trim()));
-                }
-            });
+            self.library_bar(ui);
             if let Some(message) = &self.message {
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
             }
@@ -490,37 +596,10 @@ impl eframe::App for App {
                 }
             }
 
-            let position = self.audio.position();
-            let total = self
-                .audio
-                .duration()
-                .filter(|d| !d.is_zero())
-                .map_or_else(|| "--:--".to_owned(), format_time);
-            ui.add(
-                egui::ProgressBar::new(progress(position, self.audio.duration()))
-                    .text(format!("{} / {total}", format_time(position))),
-            );
-
             ui.horizontal(|ui| {
-                if icons::button(ui, Icon::Previous, "Previous").clicked() {
-                    self.previous();
-                }
-                let (tooltip, icon) = match self.audio.state() {
-                    State::Stopped => ("Play", Icon::Play),
-                    State::Playing => ("Pause", Icon::Pause),
-                    State::Paused => ("Resume", Icon::Play),
-                };
-                if icons::button(ui, icon, tooltip).clicked() {
-                    self.toggle();
-                }
-                if icons::button(ui, Icon::Stop, "Stop").clicked() {
-                    self.audio.stop();
-                }
-                if icons::button(ui, Icon::Next, "Next").clicked() {
-                    self.next();
-                }
-                let mut volume = self.audio.volume();
                 icons::label(ui, Icon::Volume);
+                ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
+                let mut volume = self.audio.volume();
                 if ui
                     .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
                     .changed()
@@ -583,10 +662,96 @@ mod tests {
     }
 
     #[test]
-    fn toggle_icon_shows_the_next_action() {
-        assert_eq!(toggle_icon(State::Playing), Icon::Pause);
-        assert_eq!(toggle_icon(State::Paused), Icon::Play);
-        assert_eq!(toggle_icon(State::Stopped), Icon::Play);
+    fn needle_off_the_record_pauses_only_while_playing() {
+        assert_eq!(needle_action(State::Playing, false), NeedleAction::Pause);
+        assert_eq!(needle_action(State::Paused, false), NeedleAction::Keep);
+        assert_eq!(needle_action(State::Stopped, false), NeedleAction::Keep);
+    }
+
+    #[test]
+    fn needle_on_the_record_resumes_or_starts() {
+        assert_eq!(needle_action(State::Paused, true), NeedleAction::Resume);
+        assert_eq!(needle_action(State::Stopped, true), NeedleAction::Restart);
+        assert_eq!(needle_action(State::Playing, true), NeedleAction::Keep);
+    }
+
+    fn app_with(config_path: &Path) -> App {
+        App::with_config(&egui::Context::default(), Some(config_path.to_owned()))
+    }
+
+    #[test]
+    fn without_a_saved_folder_the_field_starts_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with(&dir.path().join("config.toml"));
+        assert!(app.editing_dir);
+        assert!(app.tracks.is_empty());
+    }
+
+    #[test]
+    fn loading_a_folder_saves_it_and_closes_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let music = dir.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+
+        let mut app = app_with(&config);
+        assert!(app.load_dir(music.clone()));
+        assert!(!app.editing_dir);
+        assert_eq!(app.tracks.len(), 1);
+        assert_eq!(app.dir_input, music.display().to_string());
+        assert_eq!(Config::load_from(&config).music_dir, Some(music.clone()));
+
+        // The saved folder is loaded on the next start and the field stays closed.
+        let again = app_with(&config);
+        assert!(!again.editing_dir);
+        assert_eq!(again.tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_folder_keeps_the_field_open_and_the_old_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let music = dir.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+
+        let mut app = app_with(&config);
+        assert!(app.load_dir(music.clone()));
+        app.start_editing_dir();
+        assert!(!app.load_dir(dir.path().join("missing")));
+        assert!(app.editing_dir);
+        assert!(app.message.is_some());
+        assert_eq!(app.config.music_dir, Some(music.clone()));
+        assert_eq!(Config::load_from(&config).music_dir, Some(music));
+    }
+
+    #[test]
+    fn cancelling_restores_the_current_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let mut app = app_with(&config);
+        assert!(app.load_dir(dir.path().to_owned()));
+        app.start_editing_dir();
+        assert!(app.editing_dir && app.focus_dir);
+        app.dir_input = "something else".into();
+        app.cancel_editing_dir();
+        assert!(!app.editing_dir);
+        assert_eq!(app.dir_input, dir.path().display().to_string());
+    }
+
+    #[test]
+    fn an_unreadable_saved_folder_opens_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        Config {
+            music_dir: Some(dir.path().join("gone")),
+            volume: 0.5,
+        }
+        .save_to(&config)
+        .unwrap();
+        let app = app_with(&config);
+        assert!(app.editing_dir);
+        assert!(app.message.is_some());
     }
 
     #[test]
