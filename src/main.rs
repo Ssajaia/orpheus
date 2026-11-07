@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod config;
+mod icons;
 mod library;
 mod vinyl;
 
