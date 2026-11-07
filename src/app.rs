@@ -3,16 +3,40 @@
 use crate::{
     audio::{Audio, State},
     config::{self, Config},
-    library::{self, Track},
+    library::{self, Album, Track},
 };
 use eframe::egui;
-use std::{path::PathBuf, time::Duration};
+use std::{ops::Range, path::PathBuf, time::Duration};
+
+/// Edge length (pixels) of the stored cover thumbnails.
+const COVER_PX: u32 = 160;
+/// Size (points) of a cover in the album grid.
+const GRID_COVER: f32 = 112.0;
+/// Size (points) of the cover in the album view.
+const VIEW_COVER: f32 = 96.0;
+/// Covers decoded per frame at most, so a big grid does not stall the UI.
+const COVERS_PER_FRAME: u8 = 2;
+
+/// Cover state of one album: not tried yet, none available, or a ready texture.
+#[derive(Clone)]
+enum Cover {
+    Pending,
+    Missing,
+    Ready(egui::TextureHandle),
+}
 
 pub struct App {
     config: Config,
     config_path: Option<PathBuf>,
     dir_input: String,
     tracks: Vec<Track>,
+    albums: Vec<Album>,
+    covers: Vec<Cover>,
+    cover_budget: u8,
+    /// Whether a cover file in the music folder may serve as album artwork.
+    folder_cover: bool,
+    /// Album whose tracks are shown; `None` shows the album grid.
+    selected: Option<usize>,
     current: Option<usize>,
     audio: Audio,
     message: Option<String>,
@@ -37,6 +61,11 @@ impl App {
             config,
             config_path,
             tracks: Vec::new(),
+            albums: Vec::new(),
+            covers: Vec::new(),
+            cover_budget: COVERS_PER_FRAME,
+            folder_cover: false,
+            selected: None,
             current: None,
             message: None,
         };
@@ -49,20 +78,33 @@ impl App {
     fn load_dir(&mut self, dir: PathBuf) {
         self.audio.stop();
         self.current = None;
+        self.selected = None;
         match library::scan(&dir) {
             Ok(tracks) => {
                 self.message = tracks
                     .is_empty()
                     .then(|| "No supported audio files found".into());
-                self.tracks = tracks;
+                self.set_tracks(tracks);
                 self.config.music_dir = Some(dir);
                 self.save_config();
             }
             Err(e) => {
-                self.tracks.clear();
+                self.set_tracks(Vec::new());
                 self.message = Some(format!("Cannot read directory: {e}"));
             }
         }
+    }
+
+    fn set_tracks(&mut self, tracks: Vec<Track>) {
+        self.albums = library::albums(&tracks);
+        self.covers = vec![Cover::Pending; self.albums.len()];
+        let tagged = self
+            .albums
+            .iter()
+            .filter(|a| tracks[a.tracks.start].album.is_some())
+            .count();
+        self.folder_cover = tagged == 1;
+        self.tracks = tracks;
     }
 
     fn save_config(&mut self) {
@@ -85,43 +127,219 @@ impl App {
         }
     }
 
+    /// Tracks that next/previous and automatic advance move within: the album
+    /// of the current track, else the selected album, else everything.
+    fn scope(&self) -> Range<usize> {
+        self.current
+            .and_then(|i| library::album_of(&self.albums, i))
+            .or(self.selected)
+            .and_then(|a| self.albums.get(a))
+            .map_or(0..self.tracks.len(), |a| a.tracks.clone())
+    }
+
     fn next(&mut self) {
-        if self.tracks.is_empty() {
-            return;
+        let scope = self.scope();
+        if let Some(index) = next_index(&scope, self.current) {
+            self.play_index(index);
         }
-        let index = self.current.map_or(0, |i| (i + 1) % self.tracks.len());
-        self.play_index(index);
     }
 
     fn previous(&mut self) {
-        if self.tracks.is_empty() {
-            return;
+        let scope = self.scope();
+        if let Some(index) = previous_index(&scope, self.current) {
+            self.play_index(index);
         }
-        let last = self.tracks.len() - 1;
-        let index = self
-            .current
-            .map_or(last, |i| i.checked_sub(1).unwrap_or(last));
-        self.play_index(index);
     }
 
     fn toggle(&mut self) {
         match self.audio.state() {
             State::Playing => self.audio.pause(),
             State::Paused => self.audio.resume(),
-            State::Stopped => self.play_index(self.current.unwrap_or(0)),
+            State::Stopped => {
+                let start = self.current.unwrap_or(self.scope().start);
+                self.play_index(start);
+            }
         }
     }
 
-    /// Advances to the next track when the current one ends; stops after the last.
+    /// Advances to the next track of the album when the current one ends;
+    /// stops after the album's last track.
     fn handle_track_end(&mut self) {
         if !self.audio.finished() {
             return;
         }
+        let scope = self.scope();
         match self.current {
-            Some(i) if i + 1 < self.tracks.len() => self.play_index(i + 1),
+            Some(i) if i + 1 < scope.end => self.play_index(i + 1),
             _ => self.audio.stop(),
         }
     }
+
+    /// Thumbnail of album `index`, decoding it on first use (a few per frame).
+    fn cover(&mut self, ctx: &egui::Context, index: usize) -> Option<egui::TextureHandle> {
+        match self.covers.get(index)? {
+            Cover::Ready(texture) => return Some(texture.clone()),
+            Cover::Missing => return None,
+            Cover::Pending => {}
+        }
+        if self.cover_budget == 0 {
+            ctx.request_repaint();
+            return None;
+        }
+        self.cover_budget -= 1;
+        let texture = load_cover(
+            ctx,
+            &self.tracks[self.albums[index].tracks.clone()],
+            self.folder_cover,
+        );
+        self.covers[index] = match &texture {
+            Some(t) => Cover::Ready(t.clone()),
+            None => Cover::Missing,
+        };
+        texture
+    }
+
+    fn show_cover(&mut self, ui: &mut egui::Ui, album: usize, size: f32) -> egui::Response {
+        let texture = self.cover(ui.ctx(), album);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+        match texture {
+            Some(texture) => {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter()
+                    .image(texture.id(), rect, uv, egui::Color32::WHITE);
+            }
+            None => {
+                ui.painter()
+                    .rect_filled(rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
+            }
+        }
+        if response.hovered() {
+            ui.painter().rect_stroke(
+                rect,
+                4.0,
+                ui.visuals().widgets.hovered.fg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        response
+    }
+
+    fn album_grid(&mut self, ui: &mut egui::Ui) {
+        let mut clicked = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..self.albums.len() {
+                        ui.vertical(|ui| {
+                            ui.set_width(GRID_COVER);
+                            if self.show_cover(ui, i, GRID_COVER).clicked() {
+                                clicked = Some(i);
+                            }
+                            let album = &self.albums[i];
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&album.title).strong())
+                                    .truncate(),
+                            );
+                            if let Some(artist) = &album.artist {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(artist).weak()).truncate(),
+                                );
+                            }
+                        });
+                    }
+                });
+            });
+        if clicked.is_some() {
+            self.selected = clicked;
+        }
+    }
+
+    fn album_view(&mut self, ui: &mut egui::Ui, selected: usize) {
+        let Some(album) = self.albums.get(selected).cloned() else {
+            self.selected = None;
+            return;
+        };
+        if ui.button("Back").clicked() {
+            self.selected = None;
+        }
+        ui.horizontal(|ui| {
+            self.show_cover(ui, selected, VIEW_COVER);
+            ui.vertical(|ui| {
+                ui.heading(&album.title);
+                if let Some(artist) = &album.artist {
+                    ui.label(artist);
+                }
+                ui.label(format!("{} tracks", album.tracks.len()));
+                if ui.button("Play album").clicked() {
+                    self.play_index(album.tracks.start);
+                }
+            });
+        });
+        ui.separator();
+
+        let mut clicked = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                for i in album.tracks.clone() {
+                    let track = &self.tracks[i];
+                    let label = match track.number {
+                        Some(n) => format!("{n}. {}", track.title),
+                        None => track.title.clone(),
+                    };
+                    if ui
+                        .selectable_label(self.current == Some(i), label)
+                        .clicked()
+                    {
+                        clicked = Some(i);
+                    }
+                }
+            });
+        if let Some(i) = clicked {
+            self.play_index(i);
+        }
+    }
+}
+
+/// Next track within `scope`, wrapping to its start. Starts at the scope's
+/// first track when nothing is playing (or the current track is outside it).
+fn next_index(scope: &Range<usize>, current: Option<usize>) -> Option<usize> {
+    if scope.is_empty() {
+        return None;
+    }
+    Some(match current.filter(|i| scope.contains(i)) {
+        Some(i) if i + 1 < scope.end => i + 1,
+        _ => scope.start,
+    })
+}
+
+/// Previous track within `scope`, wrapping to its end.
+fn previous_index(scope: &Range<usize>, current: Option<usize>) -> Option<usize> {
+    if scope.is_empty() {
+        return None;
+    }
+    Some(match current.filter(|i| scope.contains(i)) {
+        Some(i) if i > scope.start => i - 1,
+        _ => scope.end - 1,
+    })
+}
+
+/// Decodes the album's artwork into a small square texture. `None` when the
+/// album has no artwork or it cannot be decoded.
+fn load_cover(
+    ctx: &egui::Context,
+    tracks: &[Track],
+    folder_cover: bool,
+) -> Option<egui::TextureHandle> {
+    let bytes = library::artwork(tracks, folder_cover)?;
+    let image = image::load_from_memory(&bytes)
+        .ok()?
+        .resize_to_fill(COVER_PX, COVER_PX, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture("cover", pixels, egui::TextureOptions::LINEAR))
 }
 
 fn format_time(d: Duration) -> String {
@@ -131,6 +349,7 @@ fn format_time(d: Duration) -> String {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.cover_budget = COVERS_PER_FRAME;
         self.handle_track_end();
         // Repaint periodically only while audio is actually playing.
         if self.audio.state() == State::Playing {
@@ -214,38 +433,53 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            let mut clicked = None;
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    let mut album = None;
-                    for (i, track) in self.tracks.iter().enumerate() {
-                        // Tracks are sorted by album, so a header marks each new group.
-                        if album != Some(track.album_label()) {
-                            album = Some(track.album_label());
-                            ui.label(egui::RichText::new(track.album_label()).weak());
-                        }
-                        let label = match track.number {
-                            Some(n) => format!("{n}. {}", track.title),
-                            None => track.title.clone(),
-                        };
-                        if ui
-                            .selectable_label(self.current == Some(i), label)
-                            .clicked()
-                        {
-                            clicked = Some(i);
-                        }
-                    }
-                });
-            if let Some(i) = clicked {
-                self.play_index(i);
-            }
+        egui::CentralPanel::default().show(ui, |ui| match self.selected {
+            Some(album) => self.album_view(ui, album),
+            None => self.album_grid(ui),
         });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.audio.stop();
         self.save_config();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_moves_forward_and_wraps_within_scope() {
+        let scope = 3..6;
+        assert_eq!(next_index(&scope, Some(3)), Some(4));
+        assert_eq!(next_index(&scope, Some(5)), Some(3));
+    }
+
+    #[test]
+    fn previous_moves_back_and_wraps_within_scope() {
+        let scope = 3..6;
+        assert_eq!(previous_index(&scope, Some(5)), Some(4));
+        assert_eq!(previous_index(&scope, Some(3)), Some(5));
+    }
+
+    #[test]
+    fn nothing_playing_starts_at_scope_edges() {
+        let scope = 3..6;
+        assert_eq!(next_index(&scope, None), Some(3));
+        assert_eq!(previous_index(&scope, None), Some(5));
+    }
+
+    #[test]
+    fn current_outside_scope_is_ignored() {
+        let scope = 3..6;
+        assert_eq!(next_index(&scope, Some(9)), Some(3));
+        assert_eq!(previous_index(&scope, Some(1)), Some(5));
+    }
+
+    #[test]
+    fn empty_scope_has_no_tracks() {
+        assert_eq!(next_index(&(0..0), None), None);
+        assert_eq!(previous_index(&(0..0), Some(0)), None);
     }
 }
