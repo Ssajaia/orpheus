@@ -1,6 +1,9 @@
 //! Vinyl record and tonearm: animation state and drawing.
 
-use crate::audio::State;
+use crate::{
+    audio::State,
+    icons::{self, Icon},
+};
 use eframe::egui::{
     Color32, Painter, Pos2, Rect, Shape, Stroke, TextureId, Vec2,
     emath::Rot2,
@@ -145,19 +148,36 @@ fn sheen(painter: &Painter, center: Pos2, radius: f32, start: f32) {
     ));
 }
 
+/// Record centre and radius for a drawing area of `rect`.
+fn layout(rect: Rect) -> (Pos2, f32) {
+    let r = (rect.width() / 2.3).min(rect.height() / 2.2).max(1.0);
+    // The arm sticks out on the right and its counterweight above the record,
+    // so shift the record left and down to centre the whole.
+    (
+        pos2(rect.center().x - 0.125 * r, rect.center().y + 0.06 * r),
+        r,
+    )
+}
+
+/// True when `pos` is on the record's centre label, the play/pause button.
+pub fn label_contains(rect: Rect, pos: Pos2) -> bool {
+    let (center, r) = layout(rect);
+    (pos - center).length() <= LABEL_RADIUS * r
+}
+
 /// Draws the record and tonearm inside `rect`, scaled to fit. `cover` is the
 /// label artwork; `progress` (0..1) positions the needle along the grooves.
+/// `action` is the icon shown on the label, brighter when `hovered`.
 pub fn paint(
     painter: &Painter,
     rect: Rect,
     turntable: &Turntable,
     cover: Option<TextureId>,
     progress: f32,
+    action: Icon,
+    hovered: bool,
 ) {
-    let r = (rect.width() / 2.3).min(rect.height() / 2.2).max(1.0);
-    // The arm sticks out on the right and its counterweight above the record,
-    // so shift the record left and down to centre the whole.
-    let center = pos2(rect.center().x - 0.125 * r, rect.center().y + 0.06 * r);
+    let (center, r) = layout(rect);
     let at = |v: Vec2| center + v * r;
     let line = (r * 0.006).max(1.0);
 
@@ -203,7 +223,23 @@ pub fn paint(
         }
     }
     painter.circle_stroke(center, label, Stroke::new(line, BRASS));
-    painter.circle_filled(center, 0.03 * r, BACKGROUND);
+
+    // Play/pause button in the middle of the label; it does not turn.
+    let (backing, icon) = if hovered { (200, 255) } else { (150, 190) };
+    painter.circle_filled(center, 0.13 * r, Color32::from_black_alpha(backing));
+    painter.circle_stroke(center, 0.13 * r, Stroke::new(line, BRASS));
+    let icon_rect = Rect::from_center_size(center, Vec2::splat(0.12 * r));
+    let shifted = if action == Icon::Play {
+        icon_rect.translate(vec2(0.012 * r, 0.0)) // a triangle looks centred a bit right
+    } else {
+        icon_rect
+    };
+    icons::paint(
+        painter,
+        shifted,
+        action,
+        NEEDLE.gamma_multiply(icon as f32 / 255.0),
+    );
 
     // Tonearm.
     let tip = needle(turntable.arm, progress);
@@ -225,6 +261,36 @@ mod tests {
     use super::*;
 
     const FRAME: f32 = 1.0 / 60.0;
+
+    #[test]
+    fn only_the_label_is_a_button() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 400.0));
+        let (center, r) = layout(rect);
+        assert!(label_contains(rect, center));
+        assert!(label_contains(
+            rect,
+            center + vec2(LABEL_RADIUS * r * 0.9, 0.0)
+        ));
+        assert!(!label_contains(
+            rect,
+            center + vec2(LABEL_RADIUS * r * 1.1, 0.0)
+        ));
+        assert!(!label_contains(rect, center + vec2(0.0, 0.8 * r))); // on the grooves
+        assert!(!label_contains(rect, pos2(5.0, 5.0)));
+    }
+
+    #[test]
+    fn layout_fits_the_record_and_arm_in_the_rect() {
+        for size in [vec2(480.0, 400.0), vec2(1000.0, 300.0), vec2(200.0, 800.0)] {
+            let rect = Rect::from_min_size(pos2(7.0, 9.0), size);
+            let (center, r) = layout(rect);
+            // Left edge of the record to the arm base on the right.
+            assert!(center.x - r >= rect.min.x - 0.5);
+            assert!(center.x + 1.25 * r <= rect.max.x + 0.5);
+            assert!(center.y - 1.1 * r >= rect.min.y - 0.5);
+            assert!(center.y + r <= rect.max.y + 0.5);
+        }
+    }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
