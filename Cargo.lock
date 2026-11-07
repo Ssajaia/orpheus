@@ -1048,6 +1048,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1822,6 +1824,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "eframe",
+ "image",
  "rodio",
  "serde",
  "symphonia",
