@@ -2,6 +2,25 @@
 
 A minimal, lightweight desktop music player written in Rust (`egui`/`eframe` GUI, `rodio` audio).
 
+<p align="center">
+  <img src="assets/vinyl-playing.png" alt="Vinyl playback view with the album art as the record label and the tonearm on the record" width="420">
+</p>
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="assets/library.png" alt="Album grid with cover art" width="320"><br><sub><b>Library</b> – albums grouped from your tags, with cover art</sub></td>
+    <td align="center"><img src="assets/album.png" alt="Album view with track list and the playing track highlighted" width="320"><br><sub><b>Album</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/vinyl-playing.png" alt="Vinyl view while playing" width="320"><br><sub><b>Record view</b> – spinning at 33 ⅓ rpm, tonearm tracks progress</sub></td>
+    <td align="center"><img src="assets/vinyl-paused.png" alt="Vinyl view while paused" width="320"><br><sub><b>Paused</b></sub></td>
+  </tr>
+</table>
+
+> Screenshots were taken with a small demo library of generated tracks and artwork.
+
 ## Features
 
 - Pick a local music directory (remembered between launches).
