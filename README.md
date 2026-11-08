@@ -28,7 +28,7 @@ A minimal, lightweight desktop music player written in Rust (`egui`/`eframe` GUI
 - Reads title, artist, album and track number tags; tracks are grouped by album and ordered by track number (untagged files are kept, listed by file name under "Unknown Album").
 - Album grid with cover art (embedded artwork, or a `cover.jpg`/`cover.png`/`folder.jpg`/`folder.png` file when the folder holds a single album); the album that is playing is framed in gold. Select an album to see its tracks, then pick a track or **Play album**.
 - Vinyl player: a record with the album art as its label, turning at 33 1/3 rpm while playing. Title and artist are shown below.
-- Draggable tonearm: lift the needle off the record to pause, put it back on the record to resume from the same spot. The arm moves only along its arc, and the needle creeps inward as the track plays.
+- Draggable tonearm: lift the needle off the record to pause, put it back on the record to resume from the same spot. Clicking the arm does the same as flipping it to the other side. The arm moves only along its arc, and the needle creeps inward as the track plays.
 - Large previous and next buttons on either side of the record; volume slider at the bottom.
 - Plays an album in order and stops after its last track; previous/next stay within the album.
 - Dark theme, no network access, no telemetry.
