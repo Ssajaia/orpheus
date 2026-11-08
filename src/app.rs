@@ -450,8 +450,9 @@ impl App {
         });
     }
 
-    /// Lets the user hold the tonearm and move it along its arc. Lifting the
-    /// needle off the record pauses at once; dropping it back on resumes.
+    /// Lets the user hold the tonearm and move it along its arc, or click it.
+    /// Lifting the needle off the record pauses at once; dropping it back on
+    /// resumes. A click on the arm does the same as flipping it to the other side.
     fn drag_needle(
         &mut self,
         ui: &egui::Ui,
@@ -466,11 +467,14 @@ impl App {
             self.turntable.grab();
         }
         if !self.turntable.is_dragging() {
-            if response
+            let over_arm = response
                 .hover_pos()
-                .is_some_and(|p| vinyl::arm_contains(layout, &self.turntable, p))
-            {
+                .is_some_and(|p| vinyl::arm_contains(layout, &self.turntable, p));
+            if over_arm {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if response.clicked() && over_arm {
+                self.apply_needle(click_action(state));
             }
             return;
         }
@@ -510,7 +514,7 @@ impl App {
             ui.available_width(),
             (ui.available_height() - RECORD_TEXT_HEIGHT).max(0.0),
         );
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let layout = vinyl::layout(rect);
         self.drag_needle(ui, &response, &layout, state);
         vinyl::paint(
@@ -580,6 +584,16 @@ fn grid_columns(width: f32, gap: f32) -> usize {
 /// Edge length of an album card so `columns` of them fill `width`.
 fn card_size(width: f32, columns: usize, gap: f32) -> f32 {
     ((width - gap * (columns - 1) as f32) / columns as f32).max(1.0)
+}
+
+/// What clicking the tonearm does: the same as moving it to the other side,
+/// so playing pauses, paused resumes, and stopped starts.
+fn click_action(state: State) -> NeedleAction {
+    match state {
+        State::Playing => NeedleAction::Pause,
+        State::Paused => NeedleAction::Resume,
+        State::Stopped => NeedleAction::Restart,
+    }
 }
 
 /// A path as shown to the user; empty when there is none.
@@ -763,6 +777,17 @@ mod tests {
         assert_eq!(needle_action(State::Playing, true), NeedleAction::Keep);
     }
 
+    #[test]
+    fn clicking_the_arm_toggles_playback() {
+        assert_eq!(click_action(State::Playing), NeedleAction::Pause);
+        assert_eq!(click_action(State::Paused), NeedleAction::Resume);
+        assert_eq!(click_action(State::Stopped), NeedleAction::Restart);
+        // Moving the needle to the other side gives the same result as a click.
+        for (state, on_record) in [(State::Playing, false), (State::Paused, true)] {
+            assert_eq!(click_action(state), needle_action(state, on_record));
+        }
+    }
+
     fn app_with(config_path: &Path) -> App {
         App::with_config(&egui::Context::default(), Some(config_path.to_owned()))
     }
@@ -920,6 +945,19 @@ mod tests {
         assert_eq!(app.audio.state(), State::Stopped);
         // Previous and next then stay inside the open album.
         assert_eq!(app.scope(), album);
+    }
+
+    #[test]
+    fn clicking_the_arm_with_nothing_playing_starts_a_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let music = dir.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+        let mut app = app_with(&config);
+        assert!(app.load_dir(music));
+        app.apply_needle(click_action(app.audio.state()));
+        assert_eq!(app.current, Some(0));
     }
 
     #[test]
