@@ -16,8 +16,15 @@ use std::{
 
 /// Edge length (pixels) of the stored cover thumbnails.
 const COVER_PX: u32 = 160;
-/// Size (points) of a cover in the album grid.
-const GRID_COVER: f32 = 112.0;
+/// Width of the library panel in a wide window.
+const LIBRARY_WIDTH: f32 = 360.0;
+/// Windows narrower than this give the library panel their whole width.
+const WIDE_WINDOW: f32 = 700.0;
+/// Seconds the library panel takes to slide open or closed.
+const LIBRARY_SLIDE_SECONDS: f32 = 0.25;
+/// Narrowest an album card in the grid gets (points).
+const CARD_MIN: f32 = 130.0;
+const LIBRARY_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(26, 22, 18);
 /// Size (points) of the cover in the album view.
 const VIEW_COVER: f32 = 96.0;
 /// Delay between frames while the record or tonearm is moving (about 60 fps).
@@ -50,10 +57,10 @@ pub struct App {
     cover_budget: u8,
     /// Whether a cover file in the music folder may serve as album artwork.
     folder_cover: bool,
-    /// Album whose tracks are shown; `None` shows the album grid.
+    /// Album whose tracks are shown in the library; `None` shows the album grid.
     selected: Option<usize>,
-    /// Show the vinyl playback view instead of the library.
-    record_view: bool,
+    /// The library panel is open (or sliding open).
+    library_open: bool,
     turntable: Turntable,
     current: Option<usize>,
     audio: Audio,
@@ -66,7 +73,9 @@ impl App {
     }
 
     fn with_config(ctx: &egui::Context, config_path: Option<PathBuf>) -> Self {
-        ctx.set_visuals(egui::Visuals::dark());
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = vinyl::BACKGROUND;
+        ctx.set_visuals(visuals);
 
         let config = config_path
             .as_deref()
@@ -78,6 +87,7 @@ impl App {
             // Without a remembered folder the field is open right away.
             editing_dir: config.music_dir.is_none(),
             focus_dir: false,
+            library_open: config.music_dir.is_none(),
             config,
             config_path,
             tracks: Vec::new(),
@@ -86,7 +96,6 @@ impl App {
             cover_budget: COVERS_PER_FRAME,
             folder_cover: false,
             selected: None,
-            record_view: false,
             turntable: Turntable::default(),
             current: None,
             message: None,
@@ -103,7 +112,6 @@ impl App {
         self.audio.stop();
         self.current = None;
         self.selected = None;
-        self.record_view = false;
         match library::scan(&dir) {
             Ok(tracks) => {
                 self.message = tracks
@@ -120,6 +128,7 @@ impl App {
                 self.set_tracks(Vec::new());
                 self.message = Some(format!("Cannot read directory: {e}"));
                 self.editing_dir = true;
+                self.library_open = true;
                 false
             }
         }
@@ -198,9 +207,8 @@ impl App {
             NeedleAction::Pause => self.audio.pause(),
             NeedleAction::Resume => self.audio.resume(),
             NeedleAction::Restart => {
-                if let Some(index) = self.current {
-                    self.play_index(index);
-                }
+                let index = self.current.unwrap_or(self.scope().start);
+                self.play_index(index);
             }
         }
     }
@@ -242,7 +250,13 @@ impl App {
         texture
     }
 
-    fn show_cover(&mut self, ui: &mut egui::Ui, album: usize, size: f32) -> egui::Response {
+    fn show_cover(
+        &mut self,
+        ui: &mut egui::Ui,
+        album: usize,
+        size: f32,
+        playing: bool,
+    ) -> egui::Response {
         let texture = self.cover(ui.ctx(), album);
         let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
         match texture {
@@ -256,48 +270,74 @@ impl App {
                     .rect_filled(rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
             }
         }
-        if response.hovered() {
-            ui.painter().rect_stroke(
-                rect,
-                4.0,
-                ui.visuals().widgets.hovered.fg_stroke,
-                egui::StrokeKind::Inside,
-            );
+        // A gold frame marks the album that is playing, a lighter one the hovered album.
+        let stroke = if playing {
+            Some(egui::Stroke::new(2.0, vinyl::BRASS))
+        } else if response.hovered() {
+            Some(ui.visuals().widgets.hovered.fg_stroke)
+        } else {
+            None
+        };
+        if let Some(stroke) = stroke {
+            ui.painter()
+                .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
         }
         response
     }
 
+    /// Grid of album covers with title and artist. Only the visible rows are drawn.
     fn album_grid(&mut self, ui: &mut egui::Ui) {
+        if self.albums.is_empty() {
+            ui.label(egui::RichText::new("No albums yet").weak());
+            return;
+        }
+        let gap = ui.spacing().item_spacing.x;
+        let width = ui.available_width() - 6.0; // room for the scroll bar
+        let columns = grid_columns(width, gap);
+        let size = card_size(width, columns, gap);
+        let row_height =
+            size + 2.0 * ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+        let rows = self.albums.len().div_ceil(columns);
+        let playing = self
+            .current
+            .and_then(|i| library::album_of(&self.albums, i));
+
         let mut clicked = None;
         egui::ScrollArea::vertical()
+            .id_salt("albums")
             .auto_shrink(false)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for i in 0..self.albums.len() {
-                        ui.vertical(|ui| {
-                            ui.set_width(GRID_COVER);
-                            if self.show_cover(ui, i, GRID_COVER).clicked() {
-                                clicked = Some(i);
-                            }
-                            let album = &self.albums[i];
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&album.title).strong())
-                                    .truncate(),
-                            );
-                            if let Some(artist) = &album.artist {
+            .show_rows(ui, row_height, rows, |ui, range| {
+                for row in range {
+                    ui.horizontal(|ui| {
+                        let end = ((row + 1) * columns).min(self.albums.len());
+                        for i in row * columns..end {
+                            ui.vertical(|ui| {
+                                ui.set_width(size);
+                                if self.show_cover(ui, i, size, playing == Some(i)).clicked() {
+                                    clicked = Some(i);
+                                }
+                                let album = &self.albums[i];
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(artist).weak()).truncate(),
+                                    egui::Label::new(egui::RichText::new(&album.title).strong())
+                                        .truncate(),
                                 );
-                            }
-                        });
-                    }
-                });
+                                // A non-breaking space keeps rows the same height without an artist.
+                                let artist = album.artist.as_deref().unwrap_or("\u{a0}");
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(artist).weak().small())
+                                        .truncate(),
+                                );
+                            });
+                        }
+                    });
+                }
             });
         if clicked.is_some() {
             self.selected = clicked;
         }
     }
 
+    /// One album: cover, title, artist, a play button and its tracks in order.
     fn album_view(&mut self, ui: &mut egui::Ui, selected: usize) {
         let Some(album) = self.albums.get(selected).cloned() else {
             self.selected = None;
@@ -307,16 +347,15 @@ impl App {
             self.selected = None;
         }
         ui.horizontal(|ui| {
-            self.show_cover(ui, selected, VIEW_COVER);
+            self.show_cover(ui, selected, VIEW_COVER, false);
             ui.vertical(|ui| {
-                ui.heading(&album.title);
+                ui.add(egui::Label::new(egui::RichText::new(&album.title).heading()).truncate());
                 if let Some(artist) = &album.artist {
-                    ui.label(artist);
+                    ui.add(egui::Label::new(artist).truncate());
                 }
                 ui.label(format!("{} tracks", album.tracks.len()));
                 if ui.button("Play album").clicked() {
                     self.play_index(album.tracks.start);
-                    self.record_view = true;
                 }
             });
         });
@@ -324,6 +363,7 @@ impl App {
 
         let mut clicked = None;
         egui::ScrollArea::vertical()
+            .id_salt("tracks")
             .auto_shrink(false)
             .show(ui, |ui| {
                 for i in album.tracks.clone() {
@@ -342,7 +382,36 @@ impl App {
             });
         if let Some(i) = clicked {
             self.play_index(i);
-            self.record_view = true;
+        }
+    }
+
+    /// Contents of the library panel: title, close button, music folder, then
+    /// the album grid or the open album.
+    fn library_ui(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Library");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::button(ui, Icon::Close, "Close").clicked() {
+                            self.library_open = false;
+                        }
+                    });
+                });
+                self.library_bar(ui);
+                if let Some(message) = &self.message {
+                    ui.colored_label(egui::Color32::LIGHT_RED, message);
+                }
+                ui.separator();
+                match self.selected {
+                    Some(album) => self.album_view(ui, album),
+                    None => self.album_grid(ui),
+                }
+            });
+        // Escape closes the panel unless the folder field already used it.
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.library_open = false;
         }
     }
 
@@ -363,7 +432,7 @@ impl App {
                 if ui.button("Open").clicked() || entered {
                     self.load_dir(PathBuf::from(self.dir_input.trim()));
                 } else if ui.button("Cancel").clicked()
-                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
                 {
                     self.cancel_editing_dir();
                 }
@@ -421,14 +490,13 @@ impl App {
         }
     }
 
-    /// The vinyl playback view: record with cover art, draggable tonearm,
+    /// The vinyl player: record with cover art, draggable tonearm,
     /// previous/next buttons, title and artist.
     fn record_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(current) = self.current.filter(|&i| i < self.tracks.len()) else {
-            return;
-        };
-        let album = library::album_of(&self.albums, current);
-        let cover = album.and_then(|a| self.cover(ui.ctx(), a));
+        let current = self.current.filter(|&i| i < self.tracks.len());
+        let cover = current
+            .and_then(|i| library::album_of(&self.albums, i))
+            .and_then(|album| self.cover(ui.ctx(), album));
 
         let state = self.audio.state();
         let progress = progress(self.audio.position(), self.audio.duration());
@@ -458,13 +526,18 @@ impl App {
             self.next();
         }
 
-        let track = &self.tracks[current];
-        ui.vertical_centered(|ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(&track.title).size(20.0).strong()).truncate(),
-            );
-            let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
-            ui.add(egui::Label::new(egui::RichText::new(artist).weak()).truncate());
+        ui.vertical_centered(|ui| match current.map(|i| &self.tracks[i]) {
+            Some(track) => {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&track.title).size(20.0).strong())
+                        .truncate(),
+                );
+                let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+                ui.add(egui::Label::new(egui::RichText::new(artist).weak()).truncate());
+            }
+            None => {
+                ui.label(egui::RichText::new("Nothing playing").size(20.0).strong());
+            }
         });
     }
 }
@@ -488,6 +561,25 @@ fn needle_action(state: State, on_record: bool) -> NeedleAction {
         (State::Stopped, true) => NeedleAction::Restart,
         _ => NeedleAction::Keep,
     }
+}
+
+/// Width of the library panel when fully open.
+fn library_width(window: f32) -> f32 {
+    if window >= WIDE_WINDOW {
+        LIBRARY_WIDTH
+    } else {
+        window
+    }
+}
+
+/// Number of album cards per row for a grid `width` wide.
+fn grid_columns(width: f32, gap: f32) -> usize {
+    (((width + gap) / (CARD_MIN + gap)).floor() as usize).max(1)
+}
+
+/// Edge length of an album card so `columns` of them fill `width`.
+fn card_size(width: f32, columns: usize, gap: f32) -> f32 {
+    ((width - gap * (columns - 1) as f32) / columns as f32).max(1.0)
 }
 
 /// A path as shown to the user; empty when there is none.
@@ -556,46 +648,48 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The library panel slides open to its full width; the player gets the rest.
+        let width = library_width(ui.max_rect().width());
+        let open = ui.ctx().animate_bool_with_time_and_easing(
+            egui::Id::unique("library_open"),
+            self.library_open,
+            LIBRARY_SLIDE_SECONDS,
+            egui::emath::easing::cubic_out,
+        );
+        if open > 0.0 {
+            egui::Panel::left("library")
+                .exact_size(width * open)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(LIBRARY_BACKGROUND))
+                .show(ui, |ui| {
+                    // Lay the contents out at full width and let the panel reveal them.
+                    let panel = ui.max_rect();
+                    let full = egui::Rect::from_min_size(
+                        egui::pos2(panel.right() - width, panel.top()),
+                        egui::vec2(width, panel.height()),
+                    );
+                    let mut contents = ui.new_child(egui::UiBuilder::new().max_rect(full));
+                    contents.set_clip_rect(panel);
+                    self.library_ui(&mut contents);
+                });
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Orpheus");
-                if self.current.is_some() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if self.record_view {
-                            "Library"
-                        } else {
-                            "Record"
-                        };
-                        if ui.button(label).clicked() {
-                            self.record_view = !self.record_view;
-                        }
-                    });
+                if icons::button(ui, Icon::Library, "Library").clicked() {
+                    self.library_open = !self.library_open;
                 }
+                ui.heading("Orpheus");
             });
-            self.library_bar(ui);
-            if let Some(message) = &self.message {
+            // While the library is showing it displays messages itself.
+            if open == 0.0
+                && let Some(message) = &self.message
+            {
                 ui.colored_label(egui::Color32::LIGHT_RED, message);
             }
         });
 
-        egui::Panel::bottom("player").show(ui, |ui| {
-            let track = self.current.and_then(|i| self.tracks.get(i));
-            match track {
-                // The record view shows the title itself.
-                Some(_) if self.record_view => {}
-                Some(track) => {
-                    ui.label(egui::RichText::new(&track.title).strong());
-                    let info = match &track.artist {
-                        Some(artist) => format!("{artist} - {}", track.album_label()),
-                        None => track.album_label().to_owned(),
-                    };
-                    ui.label(info);
-                }
-                None => {
-                    ui.label(egui::RichText::new("Nothing playing").strong());
-                }
-            }
-
+        egui::Panel::bottom("volume").show(ui, |ui| {
             ui.horizontal(|ui| {
                 icons::label(ui, Icon::Volume);
                 ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
@@ -609,16 +703,10 @@ impl eframe::App for App {
             });
         });
 
-        let show_record = self.record_view && self.current.is_some();
-        let mut frame = egui::Frame::central_panel(ui.style());
-        if show_record {
-            frame = frame.fill(vinyl::BACKGROUND);
-        }
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            match (show_record, self.selected) {
-                (true, _) => self.record_ui(ui),
-                (false, Some(album)) => self.album_view(ui, album),
-                (false, None) => self.album_grid(ui),
+        egui::CentralPanel::default().show(ui, |ui| {
+            // A fully covered player (narrow window, library open) is not drawn.
+            if ui.available_width() >= 120.0 {
+                self.record_ui(ui);
             }
         });
     }
@@ -752,6 +840,100 @@ mod tests {
         let app = app_with(&config);
         assert!(app.editing_dir);
         assert!(app.message.is_some());
+    }
+
+    #[test]
+    fn library_takes_a_fixed_width_in_wide_windows_and_all_of_a_narrow_one() {
+        assert_eq!(library_width(1200.0), LIBRARY_WIDTH);
+        assert_eq!(library_width(WIDE_WINDOW), LIBRARY_WIDTH);
+        assert_eq!(library_width(WIDE_WINDOW - 1.0), WIDE_WINDOW - 1.0);
+        assert_eq!(library_width(360.0), 360.0);
+        // A wide window always leaves room for the player next to the panel.
+        const { assert!(WIDE_WINDOW - LIBRARY_WIDTH >= 300.0) };
+    }
+
+    #[test]
+    fn grid_fills_the_width_with_cards_of_at_least_the_minimum_size() {
+        let gap = 8.0;
+        for width in [120.0, 336.0, 450.0, 800.0, 1500.0] {
+            let columns = grid_columns(width, gap);
+            let size = card_size(width, columns, gap);
+            assert!(columns >= 1);
+            assert!(size >= CARD_MIN.min(width), "{width}: {size}");
+            let used = columns as f32 * size + gap * (columns - 1) as f32;
+            assert!((used - width).abs() < 0.01, "{width}: {used}");
+        }
+        assert_eq!(grid_columns(336.0, gap), 2); // the panel in a wide window
+        assert_eq!(grid_columns(50.0, gap), 1);
+    }
+
+    #[test]
+    fn library_starts_open_only_without_a_working_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        assert!(app_with(&config).library_open);
+
+        let mut app = app_with(&config);
+        assert!(app.load_dir(dir.path().to_owned()));
+        assert!(!app_with(&config).library_open);
+
+        Config {
+            music_dir: Some(dir.path().join("gone")),
+            volume: 0.5,
+        }
+        .save_to(&config)
+        .unwrap();
+        assert!(app_with(&config).library_open);
+    }
+
+    #[test]
+    fn a_failed_folder_change_reopens_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let mut app = app_with(&config);
+        assert!(app.load_dir(dir.path().to_owned()));
+        app.library_open = false;
+        assert!(!app.load_dir(dir.path().join("missing")));
+        assert!(app.library_open);
+    }
+
+    #[test]
+    fn choosing_a_track_in_the_library_makes_it_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let music = dir.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        for name in ["a.mp3", "b.mp3"] {
+            std::fs::write(music.join(name), b"").unwrap();
+        }
+        let mut app = app_with(&config);
+        assert!(app.load_dir(music));
+        assert_eq!(app.albums.len(), 1);
+        let album = app.albums[0].tracks.clone();
+        app.selected = Some(0);
+
+        // The files are not playable audio, so playback fails gracefully, but
+        // the chosen track is still the current one and the error is shown.
+        app.play_index(album.start + 1);
+        assert_eq!(app.current, Some(album.start + 1));
+        assert!(app.message.is_some());
+        assert_eq!(app.audio.state(), State::Stopped);
+        // Previous and next then stay inside the open album.
+        assert_eq!(app.scope(), album);
+    }
+
+    #[test]
+    fn the_needle_starts_the_open_album_when_nothing_has_played() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let music = dir.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        std::fs::write(music.join("a.mp3"), b"").unwrap();
+        let mut app = app_with(&config);
+        assert!(app.load_dir(music));
+        assert_eq!(app.current, None);
+        app.apply_needle(NeedleAction::Restart);
+        assert_eq!(app.current, Some(0));
     }
 
     #[test]
