@@ -17,7 +17,8 @@ pub const BACKGROUND: Color32 = Color32::from_rgb(20, 17, 14);
 const RECORD: Color32 = Color32::from_rgb(12, 12, 12);
 const RIM: Color32 = Color32::from_rgb(42, 38, 34);
 const LABEL: Color32 = Color32::from_rgb(94, 43, 43);
-const BRASS: Color32 = Color32::from_rgb(138, 115, 67);
+/// Muted gold used for rings and accents.
+pub const BRASS: Color32 = Color32::from_rgb(138, 115, 67);
 const ARM: Color32 = Color32::from_rgb(156, 146, 126);
 const ARM_DARK: Color32 = Color32::from_rgb(52, 47, 40);
 const BUTTON: Color32 = Color32::from_rgb(30, 26, 22);
