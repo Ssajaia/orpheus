@@ -1,12 +1,14 @@
 //! Simple vector icons drawn with egui shapes (no font or image assets).
 
-use eframe::egui::{Color32, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
+use eframe::egui::{Color32, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Previous,
     Next,
     Volume,
+    Library,
+    Close,
 }
 
 /// Convex polygons that make up `icon`, laid out inside `rect`.
@@ -36,6 +38,16 @@ fn parts(icon: Icon, rect: Rect) -> Vec<Vec<Pos2>> {
             // A single sound wave, as a thin bar.
             vec![at(0.76, 0.3), at(0.84, 0.3), at(0.84, 0.7), at(0.76, 0.7)],
         ],
+        // A list: three bars.
+        Icon::Library => [(0.14, 0.28), (0.43, 0.57), (0.72, 0.86)]
+            .into_iter()
+            .map(|(y0, y1)| vec![at(0.1, y0), at(0.9, y0), at(0.9, y1), at(0.1, y1)])
+            .collect(),
+        // A cross: two diagonal bars.
+        Icon::Close => vec![
+            vec![at(0.12, 0.2), at(0.2, 0.12), at(0.88, 0.8), at(0.8, 0.88)],
+            vec![at(0.8, 0.12), at(0.88, 0.2), at(0.2, 0.88), at(0.12, 0.8)],
+        ],
     }
 }
 
@@ -44,6 +56,16 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     for points in parts(icon, rect) {
         painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
     }
+}
+
+/// A small clickable icon button with a tooltip.
+pub fn button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 26.0), Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
+    let icon_rect = Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
+    paint(ui.painter(), icon_rect, icon, visuals.fg_stroke.color);
+    response.on_hover_text(tooltip)
 }
 
 /// A non-interactive icon, e.g. a label next to a slider.
@@ -57,7 +79,13 @@ pub fn label(ui: &mut Ui, icon: Icon) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 3] = [Icon::Previous, Icon::Next, Icon::Volume];
+    const ALL: [Icon; 5] = [
+        Icon::Previous,
+        Icon::Next,
+        Icon::Volume,
+        Icon::Library,
+        Icon::Close,
+    ];
 
     #[test]
     fn every_icon_stays_inside_its_rect() {
